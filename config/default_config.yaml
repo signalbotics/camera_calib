@@ -1,0 +1,22 @@
+%YAML:1.0
+
+board:
+  squares_x: 9
+  squares_y: 6
+  marker_ratio: 7.5e-01   # marker_length / square_length
+  dictionary: DICT_6X6_250
+
+# Camera indices (V4L2 device numbers)
+# Leave empty to auto-discover all connected cameras
+cameras:
+  - { index: 0, name: "front" }
+  # - { index: 2, name: "side" }
+
+calibration:
+  min_samples: 15
+  output_dir: "./calibration_results"
+
+display:
+  monitor: 0
+  fullscreen: 1
+  border_fraction: 5.0e-02   # fraction of screen reserved as border
