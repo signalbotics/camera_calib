@@ -9,6 +9,7 @@
 #include "camera_calib/pattern_display.hpp"
 #include "camera_calib/camera_manager.hpp"
 #include "camera_calib/calibrator.hpp"
+#include "camera_calib/capture_guide.hpp"
 #include "camera_calib/result_writer.hpp"
 
 using namespace camera_calib;
@@ -78,7 +79,7 @@ int main(int argc, char** argv) {
     // Create marker generator
     MarkerGenerator generator(config);
 
-    // Setup display and get monitor PPI
+    // Setup display and get monitor info
     PatternDisplay display(config.display);
     MonitorInfo monitor;
     try {
@@ -94,7 +95,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Generate and display the board (auto-fits to screen)
+    // Generate the board image and set up fullscreen display
     cv::Mat board_image = generator.generate_board_image(monitor);
     display.show(board_image);
 
@@ -111,31 +112,43 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Create calibrator
+    // Create calibrator and per-camera capture guides
     Calibrator calibrator(config.board, generator.get_board(),
                           generator.get_dictionary(), cam_mgr.count());
 
+    std::vector<CaptureGuide> guides(cam_mgr.count(), CaptureGuide(3, 3, 2));
+
     std::cout << "\nControls:" << std::endl;
-    std::cout << "  Space  - Capture sample" << std::endl;
+    std::cout << "  Space  - Force capture" << std::endl;
     std::cout << "  c      - Run calibration" << std::endl;
     std::cout << "  q      - Quit" << std::endl;
-    std::cout << "  Min samples needed: " << config.calibration.min_samples << std::endl;
+    std::cout << "\nAuto-capture is ON. Point cameras at the board and follow the on-screen guide." << std::endl;
     std::cout << std::endl;
+
+    // Track board region within the display for overlay
+    int board_w = static_cast<int>(generator.get_square_length() * 1000.0 / 25.4 * monitor.ppi)
+                  * config.board.squares_x;
+    int board_h = static_cast<int>(generator.get_square_length() * 1000.0 / 25.4 * monitor.ppi)
+                  * config.board.squares_y;
 
     // Main loop
     bool running = true;
     while (running) {
         cam_mgr.grab_all();
 
-        // Process each camera
         struct FrameDetection {
             cv::Mat display_frame;
             std::vector<cv::Point2f> corners;
             std::vector<int> ids;
             bool detected = false;
             cv::Size frame_size;
+            cv::Mat gray;
         };
         std::vector<FrameDetection> detections(cam_mgr.count());
+
+        // Use the first camera's guide for the board overlay
+        // (in multi-cam, use camera 0 as primary for guidance)
+        bool any_captured = false;
 
         for (size_t i = 0; i < cam_mgr.count(); i++) {
             if (!cam_mgr.is_connected(i)) continue;
@@ -145,38 +158,39 @@ int main(int argc, char** argv) {
 
             auto& det = detections[i];
             det.frame_size = frame.size();
+
+            // Convert to gray for sharpness check
+            if (frame.channels() == 3) {
+                cv::cvtColor(frame, det.gray, cv::COLOR_BGR2GRAY);
+            } else {
+                det.gray = frame.clone();
+            }
+
             det.detected = calibrator.detect_and_draw(
                 frame, det.display_frame, det.corners, det.ids);
 
-            // Add status text
-            std::string status = cam_mgr.get_name(i) + " | Samples: "
-                                 + std::to_string(calibrator.sample_count(i))
-                                 + "/" + std::to_string(config.calibration.min_samples);
+            // Auto-capture via guide
             if (det.detected) {
-                status += " | Corners: " + std::to_string(det.corners.size());
+                bool captured = guides[i].update(det.corners, det.frame_size, det.gray);
+                if (captured) {
+                    calibrator.add_sample(i, det.corners, det.ids, det.frame_size);
+                    any_captured = true;
+                }
             }
+
+            // Status text on camera feed
+            std::string status = cam_mgr.get_name(i) + " | Captures: "
+                                 + std::to_string(guides[i].total_captures())
+                                 + " | Zones: " + std::to_string(guides[i].zones_covered())
+                                 + "/" + std::to_string(guides[i].total_zones());
             cv::putText(det.display_frame, status, cv::Point(10, 30),
                         cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
 
             cv::imshow(cam_mgr.get_name(i), det.display_frame);
         }
 
-        int key = cv::waitKey(30);
-
-        if (key == 'q' || key == 27) {
-            running = false;
-        } else if (key == ' ') {
-            // Capture sample from all cameras that detected corners
-            int captured = 0;
-            for (size_t i = 0; i < cam_mgr.count(); i++) {
-                if (detections[i].detected) {
-                    calibrator.add_sample(i, detections[i].corners,
-                                          detections[i].ids, detections[i].frame_size);
-                    captured++;
-                }
-            }
-
-            // Add stereo samples for pairs that both detected
+        // Add stereo samples only when auto-capture fired for at least one camera
+        if (any_captured) {
             for (size_t i = 0; i < cam_mgr.count(); i++) {
                 for (size_t j = i + 1; j < cam_mgr.count(); j++) {
                     if (detections[i].detected && detections[j].detected) {
@@ -187,33 +201,54 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+        }
 
-            if (captured > 0) {
-                std::cout << "Captured sample from " << captured << " camera(s). Counts: ";
-                for (size_t i = 0; i < cam_mgr.count(); i++) {
-                    std::cout << cam_mgr.get_name(i) << "=" << calibrator.sample_count(i) << " ";
+        // Update board display with guidance overlay (merged across all cameras)
+        cv::Mat display_image = board_image.clone();
+        if (display_image.channels() == 1) {
+            cv::cvtColor(display_image, display_image, cv::COLOR_GRAY2BGR);
+        }
+        if (!guides.empty()) {
+            auto merged = CaptureGuide::merge_zones(guides);
+            bool all_done = CaptureGuide::all_cameras_complete(guides);
+            int target = CaptureGuide::worst_target(guides);
+            guides[0].draw_overlay(display_image, merged, all_done, target);
+        }
+        cv::imshow(PatternDisplay::WINDOW_NAME, display_image);
+
+        int key = cv::waitKey(30);
+
+        if (key == 'q' || key == 27) {
+            running = false;
+        } else if (key == ' ') {
+            // Manual force capture
+            int captured = 0;
+            for (size_t i = 0; i < cam_mgr.count(); i++) {
+                if (detections[i].detected) {
+                    calibrator.add_sample(i, detections[i].corners,
+                                          detections[i].ids, detections[i].frame_size);
+                    captured++;
                 }
-                std::cout << std::endl;
-            } else {
-                std::cout << "No corners detected in any camera." << std::endl;
+            }
+            if (captured > 0) {
+                std::cout << "Manual capture from " << captured << " camera(s)." << std::endl;
             }
         } else if (key == 'c') {
-            // Run calibration
             std::cout << "\n--- Running Calibration ---" << std::endl;
 
             ResultWriter writer(config.calibration.output_dir);
             std::vector<IntrinsicResult> intrinsics(cam_mgr.count());
 
-            // Intrinsic calibration per camera
             for (size_t i = 0; i < cam_mgr.count(); i++) {
-                if (calibrator.sample_count(i) < config.calibration.min_samples) {
+                int count = calibrator.sample_count(i);
+                if (count < config.calibration.min_samples) {
                     std::cout << cam_mgr.get_name(i) << ": not enough samples ("
-                              << calibrator.sample_count(i) << "/"
-                              << config.calibration.min_samples << ")" << std::endl;
+                              << count << "/" << config.calibration.min_samples << ")" << std::endl;
                     continue;
                 }
 
-                std::cout << "Calibrating " << cam_mgr.get_name(i) << "..." << std::endl;
+                std::cout << "Calibrating " << cam_mgr.get_name(i)
+                          << " (" << count << " samples)..." << std::endl;
                 intrinsics[i] = calibrator.calibrate_intrinsic(i);
 
                 if (intrinsics[i].reprojection_error >= 0) {
@@ -223,15 +258,12 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // Stereo calibration for pairs
             for (size_t i = 0; i < cam_mgr.count(); i++) {
                 for (size_t j = i + 1; j < cam_mgr.count(); j++) {
                     if (intrinsics[i].reprojection_error < 0 ||
-                        intrinsics[j].reprojection_error < 0) {
-                        continue;
-                    }
+                        intrinsics[j].reprojection_error < 0) continue;
 
-                    std::cout << "Stereo calibrating " << cam_mgr.get_name(i)
+                    std::cout << "Stereo: " << cam_mgr.get_name(i)
                               << " <-> " << cam_mgr.get_name(j) << "..." << std::endl;
 
                     auto stereo = calibrator.calibrate_stereo(i, j,
@@ -241,7 +273,7 @@ int main(int argc, char** argv) {
                         stereo.cam_b_name = cam_mgr.get_name(j);
                         writer.write_stereo(stereo);
                     } else {
-                        std::cout << "  Not enough common samples for stereo." << std::endl;
+                        std::cout << "  Not enough common samples." << std::endl;
                     }
                 }
             }

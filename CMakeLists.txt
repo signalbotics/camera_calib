@@ -16,6 +16,7 @@ add_executable(camera_calib
   src/pattern_display.cpp
   src/camera_manager.cpp
   src/calibrator.cpp
+  src/capture_guide.cpp
   src/result_writer.cpp
 )
 

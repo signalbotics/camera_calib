@@ -9,8 +9,8 @@ board:
 # Camera indices (V4L2 device numbers)
 # Leave empty to auto-discover all connected cameras
 cameras:
-  - { index: 0, name: "front" }
-  # - { index: 2, name: "side" }
+  - { index: 4, name: "left" }
+  - { index: 6, name: "right" }
 
 calibration:
   min_samples: 15

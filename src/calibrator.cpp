@@ -52,9 +52,13 @@ bool Calibrator::detect_and_draw(const cv::Mat& frame, cv::Mat& display,
     charuco_detector.detectBoard(gray, charuco_corners, charuco_ids,
                                  marker_corners, marker_ids);
 
-    if (charuco_ids.empty() || charuco_ids.size() < 4) {
+    if (charuco_ids.empty() || charuco_ids.size() < 6) {
         return false;
     }
+
+    // Sub-pixel refinement for better accuracy
+    cv::cornerSubPix(gray, charuco_corners, cv::Size(5, 5), cv::Size(-1, -1),
+                     cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::COUNT, 30, 0.01));
 
     // Draw ChArUco corners
     cv::aruco::drawDetectedCornersCharuco(display, charuco_corners, charuco_ids,
@@ -65,11 +69,37 @@ bool Calibrator::detect_and_draw(const cv::Mat& frame, cv::Mat& display,
     return true;
 }
 
+static bool is_valid_sample(const std::vector<cv::Point2f>& corners, cv::Size image_size) {
+    if (corners.size() < 8) return false;
+
+    // Check bounding box area — reject if corners are nearly collinear
+    float min_x = corners[0].x, max_x = corners[0].x;
+    float min_y = corners[0].y, max_y = corners[0].y;
+    for (const auto& c : corners) {
+        min_x = std::min(min_x, c.x);
+        max_x = std::max(max_x, c.x);
+        min_y = std::min(min_y, c.y);
+        max_y = std::max(max_y, c.y);
+    }
+    float bbox_area = (max_x - min_x) * (max_y - min_y);
+    float image_area = static_cast<float>(image_size.width * image_size.height);
+
+    // Reject if bounding box is less than 1% of image (too small/far)
+    // or if either dimension is tiny (nearly collinear)
+    if (bbox_area < image_area * 0.01f) return false;
+    if ((max_x - min_x) < image_size.width * 0.05f) return false;
+    if ((max_y - min_y) < image_size.height * 0.05f) return false;
+
+    return true;
+}
+
 void Calibrator::add_sample(size_t camera_idx,
                             const std::vector<cv::Point2f>& corners,
                             const std::vector<int>& ids,
                             cv::Size image_size) {
     if (camera_idx >= camera_samples_.size()) return;
+    if (!is_valid_sample(corners, image_size)) return;
+
     auto& samples = camera_samples_[camera_idx];
     samples.all_corners.push_back(corners);
     samples.all_ids.push_back(ids);
@@ -95,7 +125,7 @@ void Calibrator::add_stereo_sample(size_t cam_a, size_t cam_b,
         }
     }
 
-    if (common_ids.size() < 6) return;  // Need enough common points
+    if (common_ids.size() < 10) return;  // Need enough common points
 
     auto key = std::make_pair(std::min(cam_a, cam_b), std::max(cam_a, cam_b));
     auto& ss = stereo_samples_[key];
@@ -143,20 +173,94 @@ IntrinsicResult Calibrator::calibrate_intrinsic(size_t camera_idx) const {
                 img.push_back(samples.all_corners[s][i]);
             }
         }
-        if (obj.size() >= 4) {
+        if (obj.size() >= 8) {
             obj_points.push_back(obj);
             img_points.push_back(img);
         }
     }
 
-    if (obj_points.empty()) return result;
+    if (obj_points.size() < 4) return result;
 
     cv::Mat camera_matrix, dist_coeffs;
     std::vector<cv::Mat> rvecs, tvecs;
 
-    result.reprojection_error = cv::calibrateCamera(
-        obj_points, img_points, samples.image_size,
-        camera_matrix, dist_coeffs, rvecs, tvecs);
+    // Try calibration, iteratively removing bad samples on failure
+    int max_retries = static_cast<int>(obj_points.size()) / 2;
+    for (int attempt = 0; attempt <= max_retries; attempt++) {
+        try {
+            result.reprojection_error = cv::calibrateCamera(
+                obj_points, img_points, samples.image_size,
+                camera_matrix, dist_coeffs, rvecs, tvecs);
+            break;  // success
+        } catch (const cv::Exception&) {
+            if (obj_points.size() <= 4) {
+                std::cerr << "calibrateCamera failed: not enough valid samples" << std::endl;
+                return result;
+            }
+            // Remove the last sample and retry
+            obj_points.pop_back();
+            img_points.pop_back();
+            std::cout << "  Removed bad sample, retrying with "
+                      << obj_points.size() << " samples..." << std::endl;
+        }
+    }
+
+    if (result.reprojection_error < 0) return result;
+
+    // Outlier rejection: compute per-sample error, remove bad ones, recalibrate
+    // Keep iterating until reprojection error is reasonable or no more outliers
+    for (int pass = 0; pass < 10; pass++) {
+        if (obj_points.size() <= 6) break;
+
+        // Compute per-sample reprojection error
+        std::vector<double> errors(obj_points.size());
+        for (size_t i = 0; i < obj_points.size(); i++) {
+            std::vector<cv::Point2f> projected;
+            cv::projectPoints(obj_points[i], rvecs[i], tvecs[i],
+                              camera_matrix, dist_coeffs, projected);
+            errors[i] = cv::norm(img_points[i], projected, cv::NORM_L2)
+                        / projected.size();
+        }
+
+        // Find median error as robust baseline
+        std::vector<double> sorted_errors = errors;
+        std::sort(sorted_errors.begin(), sorted_errors.end());
+        double median_err = sorted_errors[sorted_errors.size() / 2];
+
+        // Find worst sample
+        double worst_err = 0;
+        size_t worst_idx = 0;
+        for (size_t i = 0; i < errors.size(); i++) {
+            if (errors[i] > worst_err) {
+                worst_err = errors[i];
+                worst_idx = i;
+            }
+        }
+
+        // Remove if: worst is >3x median OR worst is >2 pixels absolute
+        // (good calibration typically has <1 pixel error per sample)
+        bool is_outlier = (worst_err > median_err * 3.0 && worst_err > 1.0)
+                          || worst_err > 3.0;
+
+        if (is_outlier) {
+            obj_points.erase(obj_points.begin() + worst_idx);
+            img_points.erase(img_points.begin() + worst_idx);
+            std::cout << "  Removed outlier (err=" << worst_err
+                      << ", median=" << median_err
+                      << "), " << obj_points.size() << " remaining" << std::endl;
+            try {
+                rvecs.clear();
+                tvecs.clear();
+                result.reprojection_error = cv::calibrateCamera(
+                    obj_points, img_points, samples.image_size,
+                    camera_matrix, dist_coeffs, rvecs, tvecs);
+            } catch (const cv::Exception&) {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
 
     result.camera_matrix = camera_matrix;
     result.dist_coeffs = dist_coeffs;
@@ -198,7 +302,7 @@ StereoResult Calibrator::calibrate_stereo(size_t cam_a, size_t cam_b,
                 pts_b.push_back(ss.corners_b[s][i]);
             }
         }
-        if (obj.size() >= 6) {
+        if (obj.size() >= 10) {
             obj_points.push_back(obj);
             img_points_a.push_back(pts_a);
             img_points_b.push_back(pts_b);
@@ -208,19 +312,95 @@ StereoResult Calibrator::calibrate_stereo(size_t cam_a, size_t cam_b,
     if (obj_points.empty()) return result;
 
     cv::Mat R, T, E, F;
-    result.reprojection_error = cv::stereoCalibrate(
-        obj_points, img_points_a, img_points_b,
-        result_a.camera_matrix, result_a.dist_coeffs,
-        result_b.camera_matrix, result_b.dist_coeffs,
-        result_a.image_size,
-        R, T, E, F,
-        cv::CALIB_FIX_INTRINSIC);
+    cv::Mat K_a = result_a.camera_matrix.clone();
+    cv::Mat K_b = result_b.camera_matrix.clone();
+    cv::Mat D_a = result_a.dist_coeffs.clone();
+    cv::Mat D_b = result_b.dist_coeffs.clone();
+
+    try {
+        result.reprojection_error = cv::stereoCalibrate(
+            obj_points, img_points_a, img_points_b,
+            K_a, D_a, K_b, D_b,
+            result_a.image_size,
+            R, T, E, F,
+            cv::CALIB_FIX_INTRINSIC);
+    } catch (const cv::Exception& e) {
+        std::cerr << "stereoCalibrate failed: " << e.what() << std::endl;
+        return result;
+    }
+
+    // Outlier rejection: remove samples with high per-sample error and recalibrate
+    for (int pass = 0; pass < 10; pass++) {
+        if (obj_points.size() <= 6) break;
+
+        // Compute per-sample stereo reprojection error
+        std::vector<double> errors(obj_points.size());
+        for (size_t i = 0; i < obj_points.size(); i++) {
+            cv::Mat rvec_a, tvec_a;
+            cv::solvePnP(obj_points[i], img_points_a[i], K_a, D_a, rvec_a, tvec_a);
+            std::vector<cv::Point2f> proj_a, proj_b;
+            cv::projectPoints(obj_points[i], rvec_a, tvec_a, K_a, D_a, proj_a);
+
+            cv::Mat R_a;
+            cv::Rodrigues(rvec_a, R_a);
+            cv::Mat R_b = R * R_a;
+            cv::Mat t_b = R * tvec_a + T;
+            cv::Mat rvec_b;
+            cv::Rodrigues(R_b, rvec_b);
+            cv::projectPoints(obj_points[i], rvec_b, t_b, K_b, D_b, proj_b);
+
+            errors[i] = (cv::norm(img_points_a[i], proj_a, cv::NORM_L2) +
+                         cv::norm(img_points_b[i], proj_b, cv::NORM_L2))
+                        / (2.0 * proj_a.size());
+        }
+
+        std::vector<double> sorted_errors = errors;
+        std::sort(sorted_errors.begin(), sorted_errors.end());
+        double median_err = sorted_errors[sorted_errors.size() / 2];
+
+        double worst_err = 0;
+        size_t worst_idx = 0;
+        for (size_t i = 0; i < errors.size(); i++) {
+            if (errors[i] > worst_err) {
+                worst_err = errors[i];
+                worst_idx = i;
+            }
+        }
+
+        bool is_outlier = (worst_err > median_err * 2.5 && worst_err > 1.0)
+                          || worst_err > 3.0;
+
+        if (is_outlier) {
+            obj_points.erase(obj_points.begin() + worst_idx);
+            img_points_a.erase(img_points_a.begin() + worst_idx);
+            img_points_b.erase(img_points_b.begin() + worst_idx);
+            std::cout << "  Removed stereo outlier (err=" << worst_err
+                      << ", median=" << median_err
+                      << "), " << obj_points.size() << " remaining" << std::endl;
+            try {
+                K_a = result_a.camera_matrix.clone();
+                K_b = result_b.camera_matrix.clone();
+                D_a = result_a.dist_coeffs.clone();
+                D_b = result_b.dist_coeffs.clone();
+                result.reprojection_error = cv::stereoCalibrate(
+                    obj_points, img_points_a, img_points_b,
+                    K_a, D_a, K_b, D_b,
+                    result_a.image_size,
+                    R, T, E, F,
+                    cv::CALIB_FIX_INTRINSIC);
+            } catch (const cv::Exception&) {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
 
     result.R = R;
     result.T = T;
     result.E = E;
     result.F = F;
-    result.cam_a_name = "";  // filled by caller
+    result.cam_a_name = "";
     result.cam_b_name = "";
     result.num_samples = static_cast<int>(obj_points.size());
 
