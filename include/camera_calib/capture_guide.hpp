@@ -44,6 +44,13 @@ public:
     // Direction text for a given target zone
     std::string direction_text(int target) const;
 
+    // Last-frame quality signals (computed during update()).
+    bool last_sharp() const { return last_sharp_; }
+    bool last_stable() const { return last_stable_; }
+
+    // Static: draw a subtle controls footer on the board display.
+    static void draw_controls_footer(cv::Mat& display);
+
 private:
     int grid_cols_, grid_rows_;
     int min_per_zone_;
@@ -57,6 +64,8 @@ private:
     // Stability tracking
     cv::Point2f last_centroid_{-1, -1};
     int stable_frames_ = 0;
+    bool last_sharp_ = false;
+    bool last_stable_ = false;
     static constexpr int STABLE_THRESHOLD = 5;
     static constexpr float MOVE_THRESHOLD = 20.0f;
     static constexpr double SHARP_THRESHOLD = 30.0;

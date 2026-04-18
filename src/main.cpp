@@ -11,6 +11,7 @@
 #include "camera_calib/calibrator.hpp"
 #include "camera_calib/capture_guide.hpp"
 #include "camera_calib/result_writer.hpp"
+#include "camera_calib/ui.hpp"
 
 using namespace camera_calib;
 
@@ -178,13 +179,53 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // Status text on camera feed
-            std::string status = cam_mgr.get_name(i) + " | Captures: "
-                                 + std::to_string(guides[i].total_captures())
-                                 + " | Zones: " + std::to_string(guides[i].zones_covered())
-                                 + "/" + std::to_string(guides[i].total_zones());
-            cv::putText(det.display_frame, status, cv::Point(10, 30),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+            // --- Translucent status panel (top-left of camera feed) ---
+            {
+                using namespace camera_calib::ui;
+                const int panel_w = 260;
+                const int panel_h = 120;
+                const int margin = 12;
+                cv::Rect panel(margin, margin, panel_w, panel_h);
+                translucent_panel(det.display_frame, panel, BG, 0.6, 12);
+
+                // Camera name (heading)
+                text(det.display_frame, cam_mgr.get_name(i),
+                     {panel.x + 14, panel.y + 26},
+                     TEXT, FS_BODY, 2, false);
+
+                // Capture count
+                std::string caps = std::to_string(guides[i].total_captures()) + " captures";
+                text(det.display_frame, caps,
+                     {panel.x + 14, panel.y + 48},
+                     MUTED, FS_CAPTION, 1, false);
+
+                // Zone progress bar
+                double ratio = guides[i].total_zones() > 0
+                    ? static_cast<double>(guides[i].zones_covered()) / guides[i].total_zones()
+                    : 0.0;
+                cv::Rect bar(panel.x + 14, panel.y + 60,
+                             panel.width - 28, 8);
+                progress_bar(det.display_frame, bar, ratio,
+                             guides[i].is_complete() ? SUCCESS : ACCENT);
+
+                std::string zstr = std::to_string(guides[i].zones_covered())
+                                 + " / " + std::to_string(guides[i].total_zones())
+                                 + " zones";
+                text(det.display_frame, zstr,
+                     {panel.x + 14, panel.y + 88},
+                     MUTED, FS_CAPTION, 1, false);
+
+                // Sharp / stable indicators
+                auto chip = [&](int ox, const std::string& label, bool ok) {
+                    cv::Scalar col = ok ? SUCCESS : STROKE;
+                    cv::Point p(panel.x + ox, panel.y + panel_h - 16);
+                    cv::circle(det.display_frame, p, 5, col, cv::FILLED, cv::LINE_AA);
+                    text(det.display_frame, label, {p.x + 10, p.y + 4},
+                         ok ? TEXT : MUTED, FS_CAPTION, 1, false);
+                };
+                chip(14,  "sharp",  det.detected && guides[i].last_sharp());
+                chip(110, "stable", det.detected && guides[i].last_stable());
+            }
 
             cv::imshow(cam_mgr.get_name(i), det.display_frame);
         }

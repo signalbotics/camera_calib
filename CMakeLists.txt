@@ -18,6 +18,7 @@ add_executable(camera_calib
   src/calibrator.cpp
   src/capture_guide.cpp
   src/result_writer.cpp
+  src/ui.cpp
 )
 
 target_include_directories(camera_calib PRIVATE

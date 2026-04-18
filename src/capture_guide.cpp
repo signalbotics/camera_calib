@@ -1,4 +1,5 @@
 #include "camera_calib/capture_guide.hpp"
+#include "camera_calib/ui.hpp"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <numeric>
@@ -85,6 +86,8 @@ bool CaptureGuide::update(const std::vector<cv::Point2f>& corners,
     int zone = classify_zone(corners, image_size);
     bool sharp = is_sharp(gray_frame);
     bool stable = is_stable(corners);
+    last_sharp_ = sharp;
+    last_stable_ = stable;
 
     // Don't capture if this zone already has enough
     if (zone_counts_[zone] >= min_per_zone_) return false;
@@ -188,97 +191,137 @@ int CaptureGuide::worst_target(const std::vector<CaptureGuide>& guides) {
 
 void CaptureGuide::draw_overlay(cv::Mat& display, const std::vector<int>& merged_zones,
                                  bool all_complete, int target) const {
+    using namespace camera_calib::ui;
     int disp_w = display.cols;
     int disp_h = display.rows;
 
-    // Check flash
+    // --- Soft flash vignette on successful capture ---
     bool show_flash = false;
+    double flash_alpha = 0.0;
     if (flash_active_) {
         auto now = std::chrono::steady_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - flash_start_).count();
         if (ms < 300) {
             show_flash = true;
+            flash_alpha = 0.35 * (1.0 - ms / 300.0);
         } else {
             flash_active_ = false;
         }
     }
-
     if (show_flash) {
-        cv::rectangle(display, cv::Point(0, 0), cv::Point(disp_w - 1, disp_h - 1),
-                       cv::Scalar(0, 200, 0), 20);
+        cv::Mat tint(display.size(), display.type(), SUCCESS);
+        cv::addWeighted(tint, flash_alpha, display, 1.0 - flash_alpha, 0, display);
     }
 
-    // --- Zone coverage grid (bottom-right) ---
-    // Grid is drawn mirrored (flipped horizontally & vertically) so it matches
-    // the user's physical reference frame — target cell position aligns with
-    // where the user needs to move the camera.
-    int cell_size = 25;
-    int grid_w = grid_cols_ * cell_size;
-    int grid_h = grid_rows_ * cell_size;
-    int gx = disp_w - grid_w - 20;
-    int gy = disp_h - grid_h - 20;
+    // --- HUD: top bar with primary instruction ---
+    int hud_h = 72;
+    int hud_margin = 16;
+    cv::Rect hud(hud_margin, hud_margin, disp_w - 2 * hud_margin, hud_h);
+    translucent_panel(display, hud, BG, 0.62, 14);
 
-    for (int r = 0; r < grid_rows_; r++) {
-        for (int c = 0; c < grid_cols_; c++) {
-            int zone = r * grid_cols_ + c;
-            // Mirror: display position is flipped from zone's camera-image position
-            int dr = grid_rows_ - 1 - r;
-            int dc = grid_cols_ - 1 - c;
-            cv::Rect cell(gx + dc * cell_size, gy + dr * cell_size, cell_size, cell_size);
-
-            int count = (zone < static_cast<int>(merged_zones.size())) ? merged_zones[zone] : 0;
-            cv::Scalar color;
-            if (count >= min_per_zone_) {
-                color = cv::Scalar(0, 180, 0);
-            } else if (count > 0) {
-                color = cv::Scalar(0, 180, 180);
-            } else {
-                color = cv::Scalar(0, 0, 180);
-            }
-
-            cv::rectangle(display, cell, color, cv::FILLED);
-            cv::rectangle(display, cell, cv::Scalar(255, 255, 255), 1);
-
-            // Draw a small bright dot inside the target cell for clarity
-            if (zone == target && !all_complete) {
-                cv::Point center(cell.x + cell_size / 2, cell.y + cell_size / 2);
-                cv::circle(display, center, cell_size / 5, cv::Scalar(255, 255, 255), cv::FILLED);
-                cv::circle(display, center, cell_size / 5 + 2, cv::Scalar(0, 0, 0), 2);
-            }
-        }
-    }
-
-    cv::putText(display, "Coverage (all cams)", cv::Point(gx, gy - 8),
-                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(200, 200, 200), 1);
-
-    // --- Direction instruction (top center) ---
-    std::string dir = all_complete ? "CALIBRATION READY - Press 'c'"
+    std::string dir = all_complete ? "CALIBRATION READY  —  press  C"
                                    : direction_text(target);
-    int baseline = 0;
-    double font_scale = 1.0;
-    int thickness = 2;
-    auto text_size = cv::getTextSize(dir, cv::FONT_HERSHEY_SIMPLEX, font_scale, thickness, &baseline);
-    int tx = (disp_w - text_size.width) / 2;
-    int ty = 40;
+    cv::Scalar dir_color = all_complete ? SUCCESS : ACCENT;
 
-    cv::rectangle(display,
-                  cv::Point(tx - 10, ty - text_size.height - 10),
-                  cv::Point(tx + text_size.width + 10, ty + baseline + 10),
-                  cv::Scalar(0, 0, 0), cv::FILLED);
-    cv::putText(display, dir, cv::Point(tx, ty),
-                cv::FONT_HERSHEY_SIMPLEX, font_scale,
-                all_complete ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 200, 255),
-                thickness);
+    // Pulse the text when ready.
+    double pulse = 1.0;
+    if (all_complete) {
+        auto t = std::chrono::steady_clock::now().time_since_epoch();
+        double secs = std::chrono::duration<double>(t).count();
+        pulse = 0.85 + 0.15 * std::sin(secs * 4.0);
+    }
+    double fs = FS_HEADING * pulse;
+    auto ts = text_size(dir, fs, 2);
+    int tx = hud.x + (hud.width - ts.width) / 2;
+    int ty = hud.y + (hud.height + ts.height) / 2;
+    text(display, dir, {tx, ty}, dir_color, fs, 2, true);
 
-    // --- Progress text (bottom-left) ---
+    // --- Coverage card (bottom-right) ---
+    int cell = 32;
+    int card_pad = 14;
+    int grid_w = grid_cols_ * cell;
+    int grid_h = grid_rows_ * cell;
+    int card_w = grid_w + 2 * card_pad;
+    int card_h = grid_h + 2 * card_pad + 54;  // room for title + legend
+    int card_x = disp_w - card_w - hud_margin;
+    int card_y = disp_h - card_h - hud_margin;
+    cv::Rect card(card_x, card_y, card_w, card_h);
+    translucent_panel(display, card, BG, 0.62, 14);
+
+    text(display, "COVERAGE", {card_x + card_pad, card_y + card_pad + 12},
+         MUTED, FS_CAPTION, 1, false);
+
     int merged_covered = 0;
     for (int c : merged_zones) {
         if (c >= min_per_zone_) merged_covered++;
     }
-    std::string progress = "Zones: " + std::to_string(merged_covered)
-                         + "/" + std::to_string(total_zones());
-    cv::putText(display, progress, cv::Point(20, disp_h - 20),
-                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(200, 200, 200), 1);
+    std::string count_str = std::to_string(merged_covered) + " / " + std::to_string(total_zones());
+    auto cs = text_size(count_str, FS_CAPTION, 1);
+    text(display, count_str,
+         {card_x + card_w - card_pad - cs.width, card_y + card_pad + 12},
+         TEXT, FS_CAPTION, 1, false);
+
+    int gx = card_x + card_pad;
+    int gy = card_y + card_pad + 22;
+
+    for (int r = 0; r < grid_rows_; r++) {
+        for (int c = 0; c < grid_cols_; c++) {
+            int zone = r * grid_cols_ + c;
+            // Mirror so user's movement direction matches cell position.
+            int dr = grid_rows_ - 1 - r;
+            int dc = grid_cols_ - 1 - c;
+            cv::Rect rc(gx + dc * cell + 2, gy + dr * cell + 2, cell - 4, cell - 4);
+
+            int count = (zone < static_cast<int>(merged_zones.size())) ? merged_zones[zone] : 0;
+            cv::Scalar color;
+            if (count >= min_per_zone_) color = SUCCESS;
+            else if (count > 0)         color = WARN;
+            else                         color = DANGER;
+
+            // Fill with dimmed swatch, full color for border.
+            cv::Scalar dim(color[0] * 0.35, color[1] * 0.35, color[2] * 0.35);
+            fill_rounded(display, rc, dim, 4);
+            rounded_rect(display, rc, color, 1, 4);
+
+            if (zone == target && !all_complete) {
+                cv::Point center(rc.x + rc.width / 2, rc.y + rc.height / 2);
+                cv::circle(display, center, 4, ACCENT, cv::FILLED, cv::LINE_AA);
+                cv::circle(display, center, 7, ACCENT, 1, cv::LINE_AA);
+            }
+        }
+    }
+
+    // Legend row under the grid.
+    int ly = gy + grid_h + 18;
+    int lx = card_x + card_pad;
+    auto legend_dot = [&](cv::Scalar col, const std::string& label) {
+        cv::circle(display, {lx + 5, ly - 4}, 4, col, cv::FILLED, cv::LINE_AA);
+        text(display, label, {lx + 16, ly}, MUTED, FS_CAPTION, 1, false);
+        lx += 16 + text_size(label, FS_CAPTION, 1).width + 14;
+    };
+    legend_dot(DANGER,  "need");
+    legend_dot(WARN,    "some");
+    legend_dot(SUCCESS, "done");
+
+    draw_controls_footer(display);
+}
+
+// Helper (file-local): filled rounded rect backed by ui::translucent_panel internals.
+// Defined here to avoid leaking into the public API.
+void CaptureGuide::draw_controls_footer(cv::Mat& display) {
+    using namespace camera_calib::ui;
+    const std::string hint = "SPACE  force capture        C  calibrate        Q  quit";
+    auto ts = text_size(hint, FS_CAPTION, 1);
+    int pad_x = 14, pad_y = 8;
+    cv::Rect bar(
+        (display.cols - ts.width) / 2 - pad_x,
+        display.rows - ts.height - 2 * pad_y - 14,
+        ts.width + 2 * pad_x,
+        ts.height + 2 * pad_y);
+    translucent_panel(display, bar, BG, 0.55, bar.height / 2);
+    text(display, hint,
+         {bar.x + pad_x, bar.y + pad_y + ts.height},
+         MUTED, FS_CAPTION, 1, false);
 }
 
 }  // namespace camera_calib
