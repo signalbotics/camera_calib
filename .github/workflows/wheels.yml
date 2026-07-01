@@ -1,0 +1,25 @@
+name: wheels
+
+# Screen-based calibration is Linux-only (xrandr + V4L2), so we build Linux
+# wheels for cp39–cp314. Config lives in [tool.cibuildwheel] in pyproject.toml.
+# cibuildwheel >= 3.0 is required for CPython 3.14 support.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build_wheels:
+    name: Build Linux wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.1.4
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: ./wheelhouse/*.whl

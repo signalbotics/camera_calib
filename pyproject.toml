@@ -1,0 +1,52 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "camera_calib"
+version = "0.1.0"
+description = "Screen-based multi-camera ChArUco calibration"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "Signalbotics" }]
+dependencies = ["numpy"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.14"
+build-dir = "build/{wheel_tag}"
+# Only the Python module is installed into the wheel; the CLI exe is gated out
+# in CMakeLists via `if(NOT SKBUILD)`.
+cmake.args = ["-DBUILD_PYTHON_BINDINGS=ON"]
+
+[tool.scikit-build.wheel]
+# The compiled module installs to the wheel root (DESTINATION . in CMake).
+install-dir = "."
+
+# ---- Distribution matrix (runs in CI, not on this machine) ------------------
+[tool.cibuildwheel]
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_* *_i686 *_ppc64le *_s390x"
+build-frontend = "build"
+# OpenCV >= 4.7 (CharucoDetector) is not in the manylinux images, so build it
+# once per container before the wheels.
+before-all = "bash {project}/scripts/build_opencv_manylinux.sh"
+
+[tool.cibuildwheel.environment]
+OpenCV_DIR = "/opt/opencv/lib64/cmake/opencv4"
+# So auditwheel can locate the OpenCV .so files (in a non-standard prefix) to
+# vendor them into the wheel.
+LD_LIBRARY_PATH = "/opt/opencv/lib64:$LD_LIBRARY_PATH"
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+# auditwheel vendors libopencv into each wheel, but NOT the GUI/X11 stack —
+# those come from the user's desktop (vendoring them would clash with the
+# system's GTK). Exclude list may need tuning on the first CI run.
+repair-wheel-command = """auditwheel repair \
+  --exclude libgtk-3.so.0 --exclude libgdk-3.so.0 \
+  --exclude libgdk_pixbuf-2.0.so.0 \
+  --exclude libX11.so.6 --exclude libGL.so.1 \
+  --exclude libglib-2.0.so.0 --exclude libgobject-2.0.so.0 --exclude libgio-2.0.so.0 \
+  -w {dest_dir} {wheel}"""

@@ -2,3 +2,10 @@ build/
 calibration_results/
 *.o
 *.d
+.venv/
+__pycache__/
+.pytest_cache/
+dist/
+wheelhouse/
+*.whl
+*.egg-info/

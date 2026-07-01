@@ -4,7 +4,7 @@
 #include <map>
 #include <string>
 #include <opencv2/core.hpp>
-#include <opencv2/aruco.hpp>
+#include <opencv2/objdetect.hpp>
 #include <opencv2/objdetect/aruco_board.hpp>
 #include "camera_calib/config.hpp"
 

@@ -9,8 +9,9 @@ find_package(OpenCV 4 REQUIRED COMPONENTS
   core imgproc calib3d highgui videoio objdetect imgcodecs
 )
 
-add_executable(camera_calib
-  src/main.cpp
+# Core library: everything except the CLI entrypoint. Shared by the executable
+# and the Python bindings so there is a single source of calibration logic.
+add_library(camera_calib_core STATIC
   src/config.cpp
   src/marker_generator.cpp
   src/pattern_display.cpp
@@ -19,17 +20,42 @@ add_executable(camera_calib
   src/capture_guide.cpp
   src/result_writer.cpp
   src/ui.cpp
+  src/app.cpp
 )
 
-target_include_directories(camera_calib PRIVATE
+target_include_directories(camera_calib_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${OpenCV_INCLUDE_DIRS}
 )
 
-target_link_libraries(camera_calib PRIVATE
+target_link_libraries(camera_calib_core PUBLIC
   ${OpenCV_LIBS}
   pthread
 )
 
-install(TARGETS camera_calib DESTINATION bin)
-install(DIRECTORY config/ DESTINATION share/camera_calib/config)
+# PIC so the static core can be linked into the shared Python module.
+set_target_properties(camera_calib_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# CLI executable. Excluded from Python wheels (SKBUILD is set by scikit-build-core).
+if(NOT SKBUILD)
+  add_executable(camera_calib src/main.cpp)
+  target_link_libraries(camera_calib PRIVATE camera_calib_core)
+
+  install(TARGETS camera_calib DESTINATION bin)
+  install(DIRECTORY config/ DESTINATION share/camera_calib/config)
+endif()
+
+# Python bindings (pybind11). Optional so the CLI still builds without pybind11.
+option(BUILD_PYTHON_BINDINGS "Build the pybind11 Python module" ON)
+if(BUILD_PYTHON_BINDINGS)
+  find_package(pybind11 CONFIG REQUIRED)
+  pybind11_add_module(camera_calib_py python/bindings.cpp)
+  set_target_properties(camera_calib_py PROPERTIES
+    OUTPUT_NAME camera_calib
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
+  target_link_libraries(camera_calib_py PRIVATE camera_calib_core)
+
+  # Install the module at the wheel root so it imports as `camera_calib`.
+  install(TARGETS camera_calib_py LIBRARY DESTINATION .)
+endif()

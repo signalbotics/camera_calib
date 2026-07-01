@@ -1,7 +1,7 @@
 #pragma once
 
 #include <opencv2/core.hpp>
-#include <opencv2/aruco.hpp>
+#include <opencv2/objdetect.hpp>
 #include <opencv2/objdetect/aruco_board.hpp>
 #include "camera_calib/config.hpp"
 #include "camera_calib/pattern_display.hpp"
