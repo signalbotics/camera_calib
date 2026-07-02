@@ -13,9 +13,9 @@ namespace camera_calib {
 struct IntrinsicResult {
     cv::Mat camera_matrix;
     cv::Mat dist_coeffs;
-    double reprojection_error;
+    double reprojection_error = -1.0;  // < 0 means "not calibrated"
     cv::Size image_size;
-    int num_samples;
+    int num_samples = 0;
 };
 
 struct StereoResult {
@@ -25,8 +25,8 @@ struct StereoResult {
     cv::Mat T;   // translation between cameras
     cv::Mat E;   // essential matrix
     cv::Mat F;   // fundamental matrix
-    double reprojection_error;
-    int num_samples;
+    double reprojection_error = -1.0;  // < 0 means "not calibrated"
+    int num_samples = 0;
 };
 
 class Calibrator {
