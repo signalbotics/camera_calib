@@ -93,17 +93,18 @@ static bool is_valid_sample(const std::vector<cv::Point2f>& corners, cv::Size im
     return true;
 }
 
-void Calibrator::add_sample(size_t camera_idx,
+bool Calibrator::add_sample(size_t camera_idx,
                             const std::vector<cv::Point2f>& corners,
                             const std::vector<int>& ids,
                             cv::Size image_size) {
-    if (camera_idx >= camera_samples_.size()) return;
-    if (!is_valid_sample(corners, image_size)) return;
+    if (camera_idx >= camera_samples_.size()) return false;
+    if (!is_valid_sample(corners, image_size)) return false;
 
     auto& samples = camera_samples_[camera_idx];
     samples.all_corners.push_back(corners);
     samples.all_ids.push_back(ids);
     samples.image_size = image_size;
+    return true;
 }
 
 void Calibrator::add_stereo_sample(size_t cam_a, size_t cam_b,

@@ -41,8 +41,9 @@ public:
                          std::vector<cv::Point2f>& corners,
                          std::vector<int>& ids) const;
 
-    // Add a sample for a specific camera
-    void add_sample(size_t camera_idx,
+    // Add a sample for a specific camera. Returns false if rejected
+    // (too few corners / board too small in frame).
+    bool add_sample(size_t camera_idx,
                     const std::vector<cv::Point2f>& corners,
                     const std::vector<int>& ids,
                     cv::Size image_size);

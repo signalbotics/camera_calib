@@ -1,5 +1,6 @@
 #include "camera_calib/app.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
@@ -67,6 +68,27 @@ CalibrationRun run_calibration(Config config) {
     std::cout << "\nAuto-capture is ON. Point cameras at the board and follow the on-screen guide." << std::endl;
     std::cout << std::endl;
 
+    // Per-camera pipeline counters: without these a camera can silently
+    // contribute nothing for a whole session and only surface at the end.
+    struct CamStats {
+        long frames = 0;      // non-empty frames received
+        long empty = 0;       // grab produced no frame
+        long detected = 0;    // frames with the board detected
+        long accepted = 0;    // samples the calibrator kept
+        long rejected = 0;    // samples the calibrator refused
+    };
+    std::vector<CamStats> stats(cam_mgr.count());
+    auto print_stats = [&]() {
+        for (size_t i = 0; i < cam_mgr.count(); i++) {
+            std::cout << "  [" << cam_mgr.get_name(i) << "] frames=" << stats[i].frames
+                      << " empty=" << stats[i].empty
+                      << " detected=" << stats[i].detected
+                      << " accepted=" << stats[i].accepted
+                      << " rejected=" << stats[i].rejected << std::endl;
+        }
+    };
+    auto last_stats_print = std::chrono::steady_clock::now();
+
     bool running = true;
     while (running) {
         cam_mgr.grab_all();
@@ -87,7 +109,11 @@ CalibrationRun run_calibration(Config config) {
             if (!cam_mgr.is_connected(i)) continue;
 
             cv::Mat frame = cam_mgr.get_frame(i);
-            if (frame.empty()) continue;
+            if (frame.empty()) {
+                stats[i].empty++;
+                continue;
+            }
+            stats[i].frames++;
 
             auto& det = detections[i];
             det.frame_size = frame.size();
@@ -100,6 +126,7 @@ CalibrationRun run_calibration(Config config) {
 
             det.detected = calibrator.detect_and_draw(
                 frame, det.display_frame, det.corners, det.ids);
+            if (det.detected) stats[i].detected++;
 
             if (i == 0) {
                 if (det.detected) {
@@ -157,10 +184,13 @@ CalibrationRun run_calibration(Config config) {
         if (any_captured) {
             for (size_t i = 0; i < cam_mgr.count(); i++) {
                 if (detections[i].detected) {
-                    calibrator.add_sample(i, detections[i].corners,
-                                          detections[i].ids, detections[i].frame_size);
+                    bool ok = calibrator.add_sample(i, detections[i].corners,
+                                                    detections[i].ids,
+                                                    detections[i].frame_size);
+                    (ok ? stats[i].accepted : stats[i].rejected)++;
                 }
             }
+            print_stats();
             for (size_t i = 0; i < cam_mgr.count(); i++) {
                 for (size_t j = i + 1; j < cam_mgr.count(); j++) {
                     if (detections[i].detected && detections[j].detected) {
@@ -181,6 +211,14 @@ CalibrationRun run_calibration(Config config) {
         guide.draw_overlay(display_image, guide.zone_counts(),
                            guide.is_complete(), guide.current_target());
         cv::imshow(PatternDisplay::WINDOW_NAME, display_image);
+
+        // Heartbeat stats every 5s so a dead camera is visible immediately,
+        // not at the end of the session.
+        auto now_hb = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now_hb - last_stats_print).count() >= 5) {
+            last_stats_print = now_hb;
+            print_stats();
+        }
 
         int key = cv::waitKey(30);
 
