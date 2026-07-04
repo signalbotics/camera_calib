@@ -8,6 +8,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# The release step creates a GitHub Release; the default workflow token is
+# read-only and fails with "Resource not accessible by integration".
+permissions:
+  contents: write
+
 jobs:
   build_wheels:
     name: Build Linux wheels
