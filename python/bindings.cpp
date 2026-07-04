@@ -14,6 +14,7 @@
 
 #include "camera_calib/config.hpp"
 #include "camera_calib/calibrator.hpp"
+#include "camera_calib/capture_guide.hpp"
 #include "camera_calib/result_writer.hpp"
 #include "camera_calib/app.hpp"
 
@@ -256,6 +257,30 @@ PYBIND11_MODULE(camera_calib, m) {
              py::arg("cam_a"), py::arg("cam_b"),
              py::arg("result_a"), py::arg("result_b"),
              "Calibrate stereo extrinsics for a camera pair (needs both intrinsics)");
+
+    py::class_<PoseMetrics>(m, "PoseMetrics")
+        .def_readonly("center_x", &PoseMetrics::center_x)
+        .def_readonly("center_y", &PoseMetrics::center_y)
+        .def_readonly("scale", &PoseMetrics::scale)
+        .def_readonly("tilt_x", &PoseMetrics::tilt_x)
+        .def_readonly("tilt_y", &PoseMetrics::tilt_y)
+        .def_readonly("valid", &PoseMetrics::valid);
+
+    m.def(
+        "pose_metrics",
+        [](FloatArray corners, IntArray ids, int squares_x, int squares_y,
+           double square_length, int width, int height) {
+            std::vector<cv::Point2f> pts;
+            std::vector<int> pt_ids;
+            numpy_to_points(corners, ids, pts, pt_ids);
+            return compute_pose_metrics(pts, pt_ids, squares_x, squares_y,
+                                        static_cast<float>(square_length),
+                                        cv::Size(width, height));
+        },
+        py::arg("corners"), py::arg("ids"), py::arg("squares_x"),
+        py::arg("squares_y"), py::arg("square_length"), py::arg("width"),
+        py::arg("height"),
+        "Board pose in the image (center/scale/tilt) from detected corners");
 
     py::class_<CalibrationRun>(m, "CalibrationRun")
         .def_readonly("camera_names", &CalibrationRun::camera_names)

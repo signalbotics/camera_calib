@@ -1,6 +1,7 @@
 #include "camera_calib/capture_guide.hpp"
 #include "camera_calib/ui.hpp"
 #include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -8,10 +9,76 @@
 
 namespace camera_calib {
 
-CaptureGuide::CaptureGuide(int grid_cols, int grid_rows, int min_per_zone)
+PoseMetrics compute_pose_metrics(const std::vector<cv::Point2f>& corners,
+                                 const std::vector<int>& ids,
+                                 int squares_x, int squares_y, float square_length,
+                                 cv::Size image_size) {
+    PoseMetrics m;
+    if (corners.size() < 6 || corners.size() != ids.size()) return m;
+
+    // Board-plane coordinates of each detected corner. Chessboard corner ids
+    // are row-major with (squares_x - 1) inner corners per row, the first at
+    // (square, square) — same layout as CharucoBoard::getChessboardCorners().
+    const int cols = squares_x - 1;
+    const int rows = squares_y - 1;
+    std::vector<cv::Point2f> board_pts;
+    std::vector<cv::Point2f> img_pts;
+    board_pts.reserve(corners.size());
+    img_pts.reserve(corners.size());
+    for (size_t i = 0; i < ids.size(); i++) {
+        int id = ids[i];
+        if (id < 0 || id >= cols * rows) continue;
+        float bx = (id % cols + 1) * square_length;
+        float by = (id / cols + 1) * square_length;
+        board_pts.emplace_back(bx, by);
+        img_pts.push_back(corners[i]);
+    }
+    if (board_pts.size() < 6) return m;
+
+    cv::Mat H = cv::findHomography(board_pts, img_pts);
+    if (H.empty()) return m;
+    H /= H.at<double>(2, 2);
+
+    const float bw = squares_x * square_length;  // full board extents
+    const float bh = squares_y * square_length;
+
+    auto map_pt = [&](float x, float y) {
+        double w = H.at<double>(2, 0) * x + H.at<double>(2, 1) * y + 1.0;
+        return cv::Point2f(
+            static_cast<float>((H.at<double>(0, 0) * x + H.at<double>(0, 1) * y + H.at<double>(0, 2)) / w),
+            static_cast<float>((H.at<double>(1, 0) * x + H.at<double>(1, 1) * y + H.at<double>(1, 2)) / w));
+    };
+
+    cv::Point2f center = map_pt(bw / 2, bh / 2);
+    m.center_x = center.x / image_size.width;
+    m.center_y = center.y / image_size.height;
+
+    // Apparent size: bbox diagonal of the projected board vs image diagonal.
+    cv::Point2f p0 = map_pt(0, 0), p1 = map_pt(bw, 0), p2 = map_pt(bw, bh), p3 = map_pt(0, bh);
+    float min_x = std::min({p0.x, p1.x, p2.x, p3.x});
+    float max_x = std::max({p0.x, p1.x, p2.x, p3.x});
+    float min_y = std::min({p0.y, p1.y, p2.y, p3.y});
+    float max_y = std::max({p0.y, p1.y, p2.y, p3.y});
+    float board_diag = std::hypot(max_x - min_x, max_y - min_y);
+    float image_diag = std::hypot(static_cast<float>(image_size.width),
+                                  static_cast<float>(image_size.height));
+    m.scale = board_diag / image_diag;
+
+    // Perspective terms scaled by board extent -> dimensionless signed tilt.
+    m.tilt_x = static_cast<float>(H.at<double>(2, 0)) * bw;
+    m.tilt_y = static_cast<float>(H.at<double>(2, 1)) * bh;
+
+    m.valid = true;
+    return m;
+}
+
+CaptureGuide::CaptureGuide(int grid_cols, int grid_rows, int min_per_zone,
+                           int squares_x, int squares_y)
     : grid_cols_(grid_cols)
     , grid_rows_(grid_rows)
     , min_per_zone_(min_per_zone)
+    , squares_x_(squares_x)
+    , squares_y_(squares_y)
     , zone_counts_(grid_cols * grid_rows, 0) {
     target_zone_ = (grid_rows / 2) * grid_cols + (grid_cols / 2);  // start at center
 }
@@ -79,35 +146,184 @@ void CaptureGuide::advance_target() {
     target_zone_ = best;
 }
 
-bool CaptureGuide::update(const std::vector<cv::Point2f>& corners,
-                           cv::Size image_size, const cv::Mat& gray_frame) {
-    if (corners.size() < 6) return false;
+float CaptureGuide::squash_of(float tilt) {
+    return std::clamp(1.0f - 2.2f * std::abs(tilt), 0.35f, 1.0f);
+}
 
-    int zone = classify_zone(corners, image_size);
-    bool sharp = is_sharp(gray_frame);
-    bool stable = is_stable(corners);
-    last_sharp_ = sharp;
-    last_stable_ = stable;
+cv::Point2f CaptureGuide::target_center(int zone) const {
+    int tr = zone / grid_cols_;
+    int tc = zone % grid_cols_;
+    float sx = POS_SPREAD / std::max(1, grid_cols_ - 1);
+    float sy = POS_SPREAD / std::max(1, grid_rows_ - 1);
+    return {0.5f + (tc - (grid_cols_ - 1) * 0.5f) * sx,
+            0.5f + (tr - (grid_rows_ - 1) * 0.5f) * sy};
+}
 
-    // Don't capture if this zone already has enough
-    if (zone_counts_[zone] >= min_per_zone_) return false;
+bool CaptureGuide::ovals_match() const {
+    if (!disp_valid_) return false;
 
-    // Capture any zone that needs samples — target is just a suggestion
-    if (sharp && stable) {
-        zone_counts_[zone]++;
-        flash_active_ = true;
-        flash_start_ = std::chrono::steady_clock::now();
-        stable_frames_ = 0;
-        if (zone == target_zone_ || zone_counts_[target_zone_] >= min_per_zone_) {
-            advance_target();
+    // Target oval: center (tx, ty), radius rt, per-axis squash — the same
+    // parameters the overlay draws in red.
+    float ref = ref_scale_ > 0 ? ref_scale_ : 0.3f;
+    float tx = 0.5f, ty = 0.5f, rt = ref;
+    float sqx_t = 1.0f, sqy_t = 1.0f;
+    switch (stage_) {
+        case Stage::POSITIONS: {
+            cv::Point2f tcen = target_center(target_zone_);
+            tx = tcen.x;
+            ty = tcen.y;
+            break;
         }
-        std::cout << "Auto-captured zone " << zone
-                  << " (" << zones_covered() << "/" << total_zones() << " covered)"
-                  << std::endl;
-        return true;
+        case Stage::BACK:       rt = ref * BACK_FACTOR; break;
+        case Stage::TILT_LEFT:
+        case Stage::TILT_RIGHT: sqx_t = squash_of(TILT_MIN); break;
+        case Stage::TILT_UP:
+        case Stage::TILT_DOWN:  sqy_t = squash_of(TILT_MIN); break;
+        case Stage::DONE:       return false;
     }
 
-    return false;
+    // Everything below is in drawn units: radii via the same 0.45*scale
+    // mapping the overlay uses, x-offsets weighted by the display aspect.
+    float dc = std::hypot((disp_.center_x - tx) * aspect_, disp_.center_y - ty);
+    float r_t = 0.45f * rt;
+
+    // First capture defines the reference distance — require a sane size so
+    // the anchor (and every later target derived from it) is usable.
+    if (stage_ == Stage::POSITIONS && ref_scale_ <= 0) {
+        return dc < r_t * 0.40f &&
+               disp_.scale > REF_SCALE_MIN && disp_.scale < REF_SCALE_MAX;
+    }
+
+    // Flexible matching: the ovals count as matched when they substantially
+    // overlap at a similar size, OR when the smaller one sits fully inside
+    // the bigger one at a comparable size.
+    float wr = (disp_.scale * squash_of(disp_.tilt_x)) / (rt * sqx_t);
+    float hr = (disp_.scale * squash_of(disp_.tilt_y)) / (rt * sqy_t);
+    float r_l = 0.45f * disp_.scale *
+                0.5f * (squash_of(disp_.tilt_x) + squash_of(disp_.tilt_y));
+
+    bool similar = wr > 0.80f && wr < 1.25f && hr > 0.80f && hr < 1.25f &&
+                   dc < r_t * 0.40f;
+    bool contained = dc + std::min(r_l, r_t) < std::max(r_l, r_t) &&
+                     wr > 0.72f && wr < 1.40f && hr > 0.72f && hr < 1.40f;
+    return similar || contained;
+}
+
+bool CaptureGuide::stage_condition_met(const PoseMetrics& m) const {
+    if (!m.valid) return false;
+    switch (stage_) {
+        case Stage::BACK:
+            return ref_scale_ > 0 && m.scale < ref_scale_ * BACK_FACTOR;
+        case Stage::TILT_LEFT:
+            return -m.tilt_x > TILT_MIN && std::abs(m.tilt_y) < std::abs(m.tilt_x);
+        case Stage::TILT_RIGHT:
+            return m.tilt_x > TILT_MIN && std::abs(m.tilt_y) < std::abs(m.tilt_x);
+        case Stage::TILT_UP:
+            return -m.tilt_y > TILT_MIN && std::abs(m.tilt_x) < std::abs(m.tilt_y);
+        case Stage::TILT_DOWN:
+            return m.tilt_y > TILT_MIN && std::abs(m.tilt_x) < std::abs(m.tilt_y);
+        default:
+            return false;
+    }
+}
+
+void CaptureGuide::advance_stage() {
+    stage_captures_ = 0;
+    switch (stage_) {
+        case Stage::POSITIONS:  stage_ = Stage::BACK; break;
+        case Stage::BACK:       stage_ = Stage::TILT_LEFT; break;
+        case Stage::TILT_LEFT:  stage_ = Stage::TILT_RIGHT; break;
+        case Stage::TILT_RIGHT: stage_ = Stage::TILT_UP; break;
+        case Stage::TILT_UP:    stage_ = Stage::TILT_DOWN; break;
+        case Stage::TILT_DOWN:  stage_ = Stage::DONE; break;
+        case Stage::DONE: break;
+    }
+}
+
+bool CaptureGuide::update(const std::vector<cv::Point2f>& corners,
+                           const std::vector<int>& ids,
+                           cv::Size image_size, const cv::Mat& gray_frame) {
+    hold_ratio_ = 0.0f;
+    if (corners.size() < 6) {
+        last_metrics_ = PoseMetrics{};
+        return false;
+    }
+
+    // Pose is board coords in "square" units; scale/tilt are ratios, so the
+    // physical square length is irrelevant here.
+    last_metrics_ = compute_pose_metrics(corners, ids, squares_x_, squares_y_,
+                                         1.0f, image_size);
+
+    // Smoothed copy for display. The homography center is stable regardless
+    // of which subset of corners was detected this frame (the raw centroid of
+    // detected corners jumps when detections drop in and out).
+    if (last_metrics_.valid) {
+        if (!disp_valid_) {
+            disp_ = last_metrics_;
+            disp_valid_ = true;
+        } else {
+            auto ema = [](float prev, float now) {
+                return prev + SMOOTH_ALPHA * (now - prev);
+            };
+            disp_.center_x = ema(disp_.center_x, last_metrics_.center_x);
+            disp_.center_y = ema(disp_.center_y, last_metrics_.center_y);
+            disp_.scale = ema(disp_.scale, last_metrics_.scale);
+            disp_.tilt_x = ema(disp_.tilt_x, last_metrics_.tilt_x);
+            disp_.tilt_y = ema(disp_.tilt_y, last_metrics_.tilt_y);
+        }
+    }
+
+    bool sharp = is_sharp(gray_frame);
+    last_sharp_ = sharp;
+    last_stable_ = is_stable(corners);  // status chip only; capture uses the hold
+
+    // Capture fires ONLY when the blue oval geometrically coincides with the
+    // red target — the exact same numbers the overlay draws — and STAYS
+    // matched for a continuous hold (ZED's timer). Capturing on the first
+    // matching frame would fire at the tolerance boundary, i.e. the worst
+    // legal alignment.
+    if (!disp_valid_ || stage_ == Stage::DONE) return false;
+
+    const bool is_tilt_stage = stage_ == Stage::TILT_LEFT || stage_ == Stage::TILT_RIGHT ||
+                               stage_ == Stage::TILT_UP || stage_ == Stage::TILT_DOWN;
+
+    // Tilt shape is sign-ambiguous (an oval squashed left looks like one
+    // squashed right), so tilt stages additionally require the correct sign.
+    bool matched = ovals_match() && (!is_tilt_stage || stage_condition_met(disp_));
+    if (!matched) {
+        // Leak instead of reset: a single borderline frame must not wipe the
+        // hold progress (that made visibly-matched poses impossible to land).
+        match_frames_ = std::max(0, match_frames_ - 2);
+        hold_ratio_ = std::min(1.0f, static_cast<float>(match_frames_) / HOLD_FRAMES);
+        return false;
+    }
+
+    if (sharp) match_frames_++;  // blurry frames don't advance the hold
+    hold_ratio_ = std::min(1.0f, static_cast<float>(match_frames_) / HOLD_FRAMES);
+    if (match_frames_ < HOLD_FRAMES) return false;
+
+    match_frames_ = 0;
+    flash_active_ = true;
+    flash_start_ = std::chrono::steady_clock::now();
+
+    if (stage_ == Stage::POSITIONS) {
+        zone_counts_[target_zone_]++;
+        if (ref_scale_ < 0) ref_scale_ = disp_.scale;
+        std::cout << "Captured position " << target_zone_
+                  << " (" << zones_covered() << "/" << total_zones() << " covered)"
+                  << std::endl;
+        if (zones_covered() >= total_zones()) {
+            advance_stage();
+        } else if (zone_counts_[target_zone_] >= min_per_zone_) {
+            advance_target();
+        }
+    } else {
+        stage_captures_++;
+        std::cout << "Captured stage sample (" << stage_captures_ << ")" << std::endl;
+        int need = (stage_ == Stage::BACK) ? BACK_SAMPLES : TILT_SAMPLES;
+        if (stage_captures_ >= need) advance_stage();
+    }
+    return true;
 }
 
 int CaptureGuide::total_captures() const {
@@ -123,7 +339,7 @@ int CaptureGuide::zones_covered() const {
 }
 
 bool CaptureGuide::is_complete() const {
-    return zones_covered() >= total_zones();
+    return stage_ == Stage::DONE;
 }
 
 // Direction text tells user where to move the CAMERA.
@@ -194,6 +410,8 @@ void CaptureGuide::draw_overlay(cv::Mat& display, const std::vector<int>& merged
     using namespace camera_calib::ui;
     int disp_w = display.cols;
     int disp_h = display.rows;
+    // Judge x-offsets in the same space they are drawn in.
+    aspect_ = static_cast<float>(disp_w) / disp_h;
 
     // --- Soft flash vignette on successful capture ---
     bool show_flash = false;
@@ -219,8 +437,20 @@ void CaptureGuide::draw_overlay(cv::Mat& display, const std::vector<int>& merged
     cv::Rect hud(hud_margin, hud_margin, disp_w - 2 * hud_margin, hud_h);
     translucent_panel(display, hud, BG, 0.62, 14);
 
-    std::string dir = all_complete ? "CALIBRATION READY  —  press  C"
-                                   : direction_text(target);
+    std::string dir;
+    if (all_complete) {
+        dir = "CALIBRATION READY  —  press  C";
+    } else {
+        switch (stage_) {
+            case Stage::POSITIONS:  dir = direction_text(target); break;
+            case Stage::BACK:       dir = "MOVE FURTHER BACK"; break;
+            case Stage::TILT_LEFT:  dir = "TILT CAMERA LEFT"; break;
+            case Stage::TILT_RIGHT: dir = "TILT CAMERA RIGHT"; break;
+            case Stage::TILT_UP:    dir = "TILT CAMERA UP"; break;
+            case Stage::TILT_DOWN:  dir = "TILT CAMERA DOWN"; break;
+            case Stage::DONE:       dir = "WAITING FOR OTHER CAMERAS"; break;
+        }
+    }
     cv::Scalar dir_color = all_complete ? SUCCESS : ACCENT;
 
     // Pulse the text when ready.
@@ -235,6 +465,135 @@ void CaptureGuide::draw_overlay(cv::Mat& display, const std::vector<int>& merged
     int tx = hud.x + (hud.width - ts.width) / 2;
     int ty = hud.y + (hud.height + ts.height) / 2;
     text(display, dir, {tx, ty}, dir_color, fs, 2, true);
+
+    // --- ZED-style guidance: red = target, blue = live camera state ---
+    // Position coords are mirrored so the blue dot moves the same direction
+    // as the camera (matches the coverage-card mirroring below).
+    if (!all_complete) {
+        const bool is_tilt = stage_ == Stage::TILT_LEFT || stage_ == Stage::TILT_RIGHT ||
+                             stage_ == Stage::TILT_UP || stage_ == Stage::TILT_DOWN;
+        const bool holding = hold_ratio_ > 0.0f;
+        const cv::Scalar LIVE_BLUE(255, 140, 40);        // BGR: strong azure blue
+        const int r_bar_dot = std::max(10, disp_h / 90);  // display-scaled bar dots
+
+        // Target position (compressed grid during POSITIONS, center after).
+        float rx_n = 0.5f, ry_n = 0.5f;
+        if (stage_ == Stage::POSITIONS) {
+            cv::Point2f tcen = target_center(target);
+            rx_n = 1.0f - tcen.x;
+            ry_n = 1.0f - tcen.y;
+        }
+        cv::Point red(static_cast<int>(rx_n * disp_w), static_cast<int>(ry_n * disp_h));
+
+        // Scale->radius mapping shared by target and live ovals. NO upper
+        // clamp: saturating the drawn size decouples what you see from what
+        // is judged (the oval must keep responding to distance).
+        auto scale_to_r = [&](float s) {
+            return std::max(12, static_cast<int>(s * disp_h * 0.45f));
+        };
+
+        // Same squash mapping as ovals_match(): drawing and capture judgment
+        // are literally the same numbers.
+        const float tilt_squash = squash_of(TILT_MIN);
+        const int r_base = scale_to_r(ref_scale_ > 0 ? ref_scale_ : 0.3f);
+
+        // --- RED oval: the target. Fixed for the current step. ---
+        {
+            cv::Size ax(r_base, r_base);
+            if (stage_ == Stage::BACK) {
+                int r = scale_to_r((ref_scale_ > 0 ? ref_scale_ : 0.3f) * BACK_FACTOR);
+                ax = {r, r};
+            } else if (stage_ == Stage::TILT_LEFT || stage_ == Stage::TILT_RIGHT) {
+                ax.width = static_cast<int>(r_base * tilt_squash);
+            } else if (stage_ == Stage::TILT_UP || stage_ == Stage::TILT_DOWN) {
+                ax.height = static_cast<int>(r_base * tilt_squash);
+            }
+            cv::ellipse(display, red, ax, 0, 0, 360,
+                        holding ? SUCCESS : DANGER, 5, cv::LINE_AA);
+        }
+
+        // --- BLUE oval: your camera, live. Aim moves it, distance sizes it,
+        // tilt squashes it. Match it onto the red one. ---
+        if (disp_valid_) {
+            cv::Point blue(static_cast<int>((1.0f - disp_.center_x) * disp_w),
+                           static_cast<int>((1.0f - disp_.center_y) * disp_h));
+            int r = scale_to_r(disp_.scale);
+            cv::Size ax(static_cast<int>(r * squash_of(disp_.tilt_x)),
+                        static_cast<int>(r * squash_of(disp_.tilt_y)));
+            cv::ellipse(display, blue, ax, 0, 0, 360,
+                        holding ? SUCCESS : LIVE_BLUE, 6, cv::LINE_AA);
+        }
+
+        // --- Bottom (horizontal) & left (vertical) bars ---
+        // POSITIONS / BACK: placement — align blue dot to red tick.
+        // TILT stages: tilt gauges — drive the blue dot into the marked zone.
+        const int bt = 12;
+        cv::Rect hbar(disp_w / 6, disp_h - 60 - bt, disp_w * 2 / 3, bt);
+        cv::Rect vbar(28, disp_h / 6, bt, disp_h * 2 / 3);
+        translucent_panel(display, hbar, BG, 0.55, bt / 2);
+        translucent_panel(display, vbar, BG, 0.55, bt / 2);
+
+        if (!is_tilt) {
+            int hx = hbar.x + static_cast<int>(rx_n * hbar.width);
+            cv::line(display, {hx, hbar.y - 8}, {hx, hbar.y + bt + 8}, DANGER, 3, cv::LINE_AA);
+            int vy = vbar.y + static_cast<int>(ry_n * vbar.height);
+            cv::line(display, {vbar.x - 8, vy}, {vbar.x + bt + 8, vy}, DANGER, 3, cv::LINE_AA);
+
+            if (disp_valid_) {
+                float bx_n = 1.0f - disp_.center_x;
+                float by_n = 1.0f - disp_.center_y;
+                bool h_ok = std::abs(bx_n - rx_n) < 0.5f / grid_cols_;
+                bool v_ok = std::abs(by_n - ry_n) < 0.5f / grid_rows_;
+                int bx = hbar.x + static_cast<int>(std::clamp(bx_n, 0.0f, 1.0f) * hbar.width);
+                cv::circle(display, {bx, hbar.y + bt / 2}, r_bar_dot,
+                           h_ok ? SUCCESS : LIVE_BLUE, cv::FILLED, cv::LINE_AA);
+                int by = vbar.y + static_cast<int>(std::clamp(by_n, 0.0f, 1.0f) * vbar.height);
+                cv::circle(display, {vbar.x + bt / 2, by}, r_bar_dot,
+                           v_ok ? SUCCESS : LIVE_BLUE, cv::FILLED, cv::LINE_AA);
+            }
+        } else {
+            // Tilt gauges: map tilt in [-TILT_SPAN, +TILT_SPAN] onto the bar,
+            // center line = no tilt, shaded zone = required tilt.
+            const float TILT_SPAN = 0.30f;
+            auto tilt_to_frac = [&](float t) {
+                return std::clamp(0.5f + 0.5f * t / TILT_SPAN, 0.0f, 1.0f);
+            };
+            const bool horiz = stage_ == Stage::TILT_LEFT || stage_ == Stage::TILT_RIGHT;
+            const float sign = (stage_ == Stage::TILT_LEFT || stage_ == Stage::TILT_UP)
+                               ? -1.0f : 1.0f;
+            cv::Rect& bar = horiz ? hbar : vbar;
+            // Judge on the smoothed pose — the same values the ovals draw.
+            const bool active_met = disp_valid_ && stage_condition_met(disp_);
+
+            // Required zone: from ±TILT_MIN to the bar end on the demanded side.
+            float z0 = tilt_to_frac(sign * TILT_MIN);
+            float z1 = tilt_to_frac(sign * TILT_SPAN);
+            if (z0 > z1) std::swap(z0, z1);
+            if (horiz) {
+                cv::Rect zone(bar.x + static_cast<int>(z0 * bar.width), bar.y,
+                              std::max(4, static_cast<int>((z1 - z0) * bar.width)), bt);
+                fill_rounded(display, zone, active_met ? SUCCESS : DANGER, bt / 2);
+                int cx0 = bar.x + bar.width / 2;
+                cv::line(display, {cx0, bar.y - 8}, {cx0, bar.y + bt + 8}, MUTED, 2, cv::LINE_AA);
+                if (disp_valid_) {
+                    int bx = bar.x + static_cast<int>(tilt_to_frac(disp_.tilt_x) * bar.width);
+                    cv::circle(display, {bx, bar.y + bt / 2}, r_bar_dot,
+                               active_met ? SUCCESS : LIVE_BLUE, cv::FILLED, cv::LINE_AA);
+                }
+            } else {
+                cv::Rect zone(bar.x, bar.y + static_cast<int>(z0 * bar.height), bt,
+                              std::max(4, static_cast<int>((z1 - z0) * bar.height)));
+                fill_rounded(display, zone, active_met ? SUCCESS : DANGER, bt / 2);
+                int cy0 = bar.y + bar.height / 2;
+                cv::line(display, {bar.x - 8, cy0}, {bar.x + bt + 8, cy0}, MUTED, 2, cv::LINE_AA);
+                if (disp_valid_) {
+                    int by = bar.y + static_cast<int>(tilt_to_frac(disp_.tilt_y) * bar.height);
+                    cv::circle(display, {bar.x + bt / 2, by}, r_bar_dot,
+                               active_met ? SUCCESS : LIVE_BLUE, cv::FILLED, cv::LINE_AA);
+                }
+            }
+        }
+    }
 
     // --- Coverage card (bottom-right) ---
     int cell = 32;

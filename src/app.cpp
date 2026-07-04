@@ -50,7 +50,11 @@ CalibrationRun run_calibration(Config config) {
     Calibrator calibrator(config.board, generator.get_board(),
                           generator.get_dictionary(), cam_mgr.count());
 
-    std::vector<CaptureGuide> guides(cam_mgr.count(), CaptureGuide(3, 3, 2));
+    // ONE guide, driven by the first camera. The board display shows one
+    // red target and one blue oval — if every camera captured on its own
+    // (invisible) guide, photos would fire while the visible ovals are apart.
+    // When the primary matches and holds, ALL cameras sample simultaneously.
+    CaptureGuide guide(3, 3, 2, config.board.squares_x, config.board.squares_y);
 
     for (size_t i = 0; i < cam_mgr.count(); i++) {
         run.camera_names.push_back(cam_mgr.get_name(i));
@@ -97,11 +101,12 @@ CalibrationRun run_calibration(Config config) {
             det.detected = calibrator.detect_and_draw(
                 frame, det.display_frame, det.corners, det.ids);
 
-            if (det.detected) {
-                bool captured = guides[i].update(det.corners, det.frame_size, det.gray);
-                if (captured) {
-                    calibrator.add_sample(i, det.corners, det.ids, det.frame_size);
-                    any_captured = true;
+            if (i == 0) {
+                if (det.detected) {
+                    any_captured = guide.update(det.corners, det.ids,
+                                                det.frame_size, det.gray);
+                } else {
+                    any_captured = guide.update({}, {}, det.frame_size, det.gray);
                 }
             }
 
@@ -117,19 +122,19 @@ CalibrationRun run_calibration(Config config) {
                 text(det.display_frame, cam_mgr.get_name(i),
                      {panel.x + 14, panel.y + 26}, TEXT, FS_BODY, 2, false);
 
-                std::string caps = std::to_string(guides[i].total_captures()) + " captures";
+                std::string caps = std::to_string(calibrator.sample_count(i)) + " samples";
                 text(det.display_frame, caps,
                      {panel.x + 14, panel.y + 48}, MUTED, FS_CAPTION, 1, false);
 
-                double ratio = guides[i].total_zones() > 0
-                    ? static_cast<double>(guides[i].zones_covered()) / guides[i].total_zones()
+                double ratio = guide.total_zones() > 0
+                    ? static_cast<double>(guide.zones_covered()) / guide.total_zones()
                     : 0.0;
                 cv::Rect bar(panel.x + 14, panel.y + 60, panel.width - 28, 8);
                 progress_bar(det.display_frame, bar, ratio,
-                             guides[i].is_complete() ? SUCCESS : ACCENT);
+                             guide.is_complete() ? SUCCESS : ACCENT);
 
-                std::string zstr = std::to_string(guides[i].zones_covered())
-                                 + " / " + std::to_string(guides[i].total_zones()) + " zones";
+                std::string zstr = std::to_string(guide.zones_covered())
+                                 + " / " + std::to_string(guide.total_zones()) + " zones";
                 text(det.display_frame, zstr,
                      {panel.x + 14, panel.y + 88}, MUTED, FS_CAPTION, 1, false);
 
@@ -140,15 +145,22 @@ CalibrationRun run_calibration(Config config) {
                     text(det.display_frame, label, {p.x + 10, p.y + 4},
                          ok ? TEXT : MUTED, FS_CAPTION, 1, false);
                 };
-                chip(14, "sharp", det.detected && guides[i].last_sharp());
-                chip(110, "stable", det.detected && guides[i].last_stable());
+                chip(14, "board", det.detected);
+                chip(110, "sharp", det.detected && guide.last_sharp());
             }
 
             cv::imshow(cam_mgr.get_name(i), det.display_frame);
         }
 
-        // Add stereo samples only when auto-capture fired for at least one camera.
+        // The primary camera's guide captured: sample EVERY camera that sees
+        // the board this frame, plus the stereo pairs.
         if (any_captured) {
+            for (size_t i = 0; i < cam_mgr.count(); i++) {
+                if (detections[i].detected) {
+                    calibrator.add_sample(i, detections[i].corners,
+                                          detections[i].ids, detections[i].frame_size);
+                }
+            }
             for (size_t i = 0; i < cam_mgr.count(); i++) {
                 for (size_t j = i + 1; j < cam_mgr.count(); j++) {
                     if (detections[i].detected && detections[j].detected) {
@@ -161,17 +173,13 @@ CalibrationRun run_calibration(Config config) {
             }
         }
 
-        // Update board display with guidance overlay (merged across all cameras).
+        // Board display: the single guide's target + live oval.
         cv::Mat display_image = board_image.clone();
         if (display_image.channels() == 1) {
             cv::cvtColor(display_image, display_image, cv::COLOR_GRAY2BGR);
         }
-        if (!guides.empty()) {
-            auto merged = CaptureGuide::merge_zones(guides);
-            bool all_done = CaptureGuide::all_cameras_complete(guides);
-            int target = CaptureGuide::worst_target(guides);
-            guides[0].draw_overlay(display_image, merged, all_done, target);
-        }
+        guide.draw_overlay(display_image, guide.zone_counts(),
+                           guide.is_complete(), guide.current_target());
         cv::imshow(PatternDisplay::WINDOW_NAME, display_image);
 
         int key = cv::waitKey(30);
