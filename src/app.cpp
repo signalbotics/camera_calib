@@ -1,7 +1,9 @@
 #include "camera_calib/app.hpp"
 
 #include <chrono>
+#include <filesystem>
 #include <iostream>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -105,6 +107,12 @@ CalibrationRun run_calibration(Config config) {
                    std::chrono::steady_clock::now() - t0).count();
     };
 
+    // Outage forensics: frames saved when the guide camera loses the board.
+    auto last_primary_detect = std::chrono::steady_clock::now();
+    auto last_dump = last_primary_detect;
+    int dump_count = 0;
+    std::filesystem::create_directories("/tmp/calib_debug");
+
     // Precompute the BGR board base once; reuse one display buffer.
     cv::Mat board_bgr;
     if (board_image.channels() == 1) {
@@ -162,8 +170,23 @@ CalibrationRun run_calibration(Config config) {
                 if (det.detected) {
                     any_captured = guide.update(det.corners, det.ids,
                                                 det.frame_size, det.gray);
+                    last_primary_detect = std::chrono::steady_clock::now();
                 } else {
                     any_captured = guide.update({}, {}, det.frame_size, det.gray);
+                    // Detection outage on the guide camera: dump what it
+                    // actually sees so the cause (exposure swing, banding,
+                    // blur) can be inspected instead of guessed.
+                    auto now_od = std::chrono::steady_clock::now();
+                    if (dump_count < 8 &&
+                        std::chrono::duration<double>(now_od - last_primary_detect).count() > 2.0 &&
+                        std::chrono::duration<double>(now_od - last_dump).count() > 1.5) {
+                        last_dump = now_od;
+                        std::string path = "/tmp/calib_debug/lost_" +
+                                           std::to_string(dump_count++) + ".png";
+                        cv::imwrite(path, det.gray);
+                        std::cout << "[debug] primary camera lost the board >2s — saved "
+                                  << path << std::endl;
+                    }
                 }
             }
 

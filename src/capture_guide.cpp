@@ -475,6 +475,10 @@ void CaptureGuide::draw_overlay(cv::Mat& display, const std::vector<int>& merged
     std::string dir;
     if (all_complete) {
         dir = "CALIBRATION READY  —  press  C";
+    } else if (disp_valid_ && !last_metrics_.valid) {
+        // The guide camera does not currently see the board — say so instead
+        // of silently freezing the overlay.
+        dir = "BOARD NOT VISIBLE  —  AIM BACK AT THE SCREEN";
     } else {
         switch (stage_) {
             case Stage::POSITIONS:  dir = direction_text(target); break;
@@ -486,7 +490,9 @@ void CaptureGuide::draw_overlay(cv::Mat& display, const std::vector<int>& merged
             case Stage::DONE:       dir = "WAITING FOR OTHER CAMERAS"; break;
         }
     }
-    cv::Scalar dir_color = all_complete ? SUCCESS : ACCENT;
+    cv::Scalar dir_color = all_complete ? SUCCESS
+                           : (disp_valid_ && !last_metrics_.valid) ? DANGER
+                                                                   : ACCENT;
 
     // Pulse the text when ready.
     double pulse = 1.0;
@@ -555,8 +561,12 @@ void CaptureGuide::draw_overlay(cv::Mat& display, const std::vector<int>& merged
             int r = scale_to_r(disp_.scale);
             cv::Size ax(static_cast<int>(r * squash_of(disp_.tilt_x)),
                         static_cast<int>(r * squash_of(disp_.tilt_y)));
+            // Grey ghost when the camera can't see the board right now —
+            // a frozen blue oval reads as an application hang.
+            const bool live = last_metrics_.valid;
             cv::ellipse(display, blue, ax, 0, 0, 360,
-                        holding ? SUCCESS : LIVE_BLUE, 6, cv::LINE_AA);
+                        !live ? MUTED : holding ? SUCCESS : LIVE_BLUE,
+                        live ? 6 : 3, cv::LINE_AA);
         }
 
         // --- Bottom (horizontal) & left (vertical) bars ---
