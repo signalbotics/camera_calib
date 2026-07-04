@@ -15,6 +15,8 @@ Calibrator::Calibrator(const BoardConfig& board_config,
     , board_(board)
     , dictionary_(dictionary) {
     detector_params_ = cv::makePtr<cv::aruco::DetectorParameters>();
+    aruco_detector_ = cv::makePtr<cv::aruco::ArucoDetector>(*dictionary_, *detector_params_);
+    charuco_detector_ = cv::makePtr<cv::aruco::CharucoDetector>(*board_);
     camera_samples_.resize(num_cameras);
 }
 
@@ -35,8 +37,7 @@ bool Calibrator::detect_and_draw(const cv::Mat& frame, cv::Mat& display,
     std::vector<int> marker_ids;
     std::vector<std::vector<cv::Point2f>> rejected;
 
-    cv::aruco::ArucoDetector detector(*dictionary_, *detector_params_);
-    detector.detectMarkers(gray, marker_corners, marker_ids, rejected);
+    aruco_detector_->detectMarkers(gray, marker_corners, marker_ids, rejected);
 
     if (marker_ids.empty()) {
         return false;
@@ -46,19 +47,17 @@ bool Calibrator::detect_and_draw(const cv::Mat& frame, cv::Mat& display,
     cv::aruco::drawDetectedMarkers(display, marker_corners, marker_ids);
 
     // Interpolate ChArUco corners
-    cv::aruco::CharucoDetector charuco_detector(*board_);
     std::vector<cv::Point2f> charuco_corners;
     std::vector<int> charuco_ids;
-    charuco_detector.detectBoard(gray, charuco_corners, charuco_ids,
-                                 marker_corners, marker_ids);
+    charuco_detector_->detectBoard(gray, charuco_corners, charuco_ids,
+                                   marker_corners, marker_ids);
 
     if (charuco_ids.empty() || charuco_ids.size() < 6) {
         return false;
     }
 
-    // Sub-pixel refinement for better accuracy
-    cv::cornerSubPix(gray, charuco_corners, cv::Size(5, 5), cv::Size(-1, -1),
-                     cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::COUNT, 30, 0.01));
+    // NOTE: no sub-pixel refinement here — this runs every preview frame and
+    // guidance doesn't need it. Callers refine corners at capture time.
 
     // Draw ChArUco corners
     cv::aruco::drawDetectedCornersCharuco(display, charuco_corners, charuco_ids,

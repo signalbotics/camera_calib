@@ -78,6 +78,10 @@ CalibrationRun run_calibration(Config config) {
         long rejected = 0;    // samples the calibrator refused
     };
     std::vector<CamStats> stats(cam_mgr.count());
+    // Loop phase timings (ms accumulated since last heartbeat) — makes the
+    // bottleneck visible instead of guessed.
+    double t_grab = 0, t_detect = 0, t_draw = 0;
+    long t_loops = 0;
     auto print_stats = [&]() {
         for (size_t i = 0; i < cam_mgr.count(); i++) {
             std::cout << "  [" << cam_mgr.get_name(i) << "] frames=" << stats[i].frames
@@ -86,12 +90,36 @@ CalibrationRun run_calibration(Config config) {
                       << " accepted=" << stats[i].accepted
                       << " rejected=" << stats[i].rejected << std::endl;
         }
+        if (t_loops > 0) {
+            std::cout << "  [timing] loops=" << t_loops
+                      << "  grab=" << t_grab / t_loops << "ms"
+                      << "  detect=" << t_detect / t_loops << "ms"
+                      << "  draw+show=" << t_draw / t_loops << "ms" << std::endl;
+        }
+        t_grab = t_detect = t_draw = 0;
+        t_loops = 0;
     };
     auto last_stats_print = std::chrono::steady_clock::now();
+    auto ms_since = [](std::chrono::steady_clock::time_point t0) {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0).count();
+    };
+
+    // Precompute the BGR board base once; reuse one display buffer.
+    cv::Mat board_bgr;
+    if (board_image.channels() == 1) {
+        cv::cvtColor(board_image, board_bgr, cv::COLOR_GRAY2BGR);
+    } else {
+        board_bgr = board_image;
+    }
+    cv::Mat display_image;
 
     bool running = true;
     while (running) {
+        t_loops++;
+        auto t0 = std::chrono::steady_clock::now();
         cam_mgr.grab_all();
+        t_grab += ms_since(t0);
 
         struct FrameDetection {
             cv::Mat display_frame;
@@ -124,8 +152,10 @@ CalibrationRun run_calibration(Config config) {
                 det.gray = frame.clone();
             }
 
+            auto td = std::chrono::steady_clock::now();
             det.detected = calibrator.detect_and_draw(
                 frame, det.display_frame, det.corners, det.ids);
+            t_detect += ms_since(td);
             if (det.detected) stats[i].detected++;
 
             if (i == 0) {
@@ -180,10 +210,16 @@ CalibrationRun run_calibration(Config config) {
         }
 
         // The primary camera's guide captured: sample EVERY camera that sees
-        // the board this frame, plus the stereo pairs.
+        // the board this frame, plus the stereo pairs. Sub-pixel refinement
+        // happens only here — on the ~24 frames that matter, not on every
+        // preview frame.
         if (any_captured) {
             for (size_t i = 0; i < cam_mgr.count(); i++) {
                 if (detections[i].detected) {
+                    cv::cornerSubPix(detections[i].gray, detections[i].corners,
+                                     cv::Size(5, 5), cv::Size(-1, -1),
+                                     cv::TermCriteria(cv::TermCriteria::EPS +
+                                                      cv::TermCriteria::COUNT, 30, 0.01));
                     bool ok = calibrator.add_sample(i, detections[i].corners,
                                                     detections[i].ids,
                                                     detections[i].frame_size);
@@ -203,14 +239,15 @@ CalibrationRun run_calibration(Config config) {
             }
         }
 
-        // Board display: the single guide's target + live oval.
-        cv::Mat display_image = board_image.clone();
-        if (display_image.channels() == 1) {
-            cv::cvtColor(display_image, display_image, cv::COLOR_GRAY2BGR);
-        }
+        // Board display: the single guide's target + live oval. The BGR base
+        // is precomputed and the buffer reused — cloning + converting a 4K
+        // image every frame was the heaviest fixed cost in the loop.
+        auto tdr = std::chrono::steady_clock::now();
+        board_bgr.copyTo(display_image);
         guide.draw_overlay(display_image, guide.zone_counts(),
                            guide.is_complete(), guide.current_target());
         cv::imshow(PatternDisplay::WINDOW_NAME, display_image);
+        t_draw += ms_since(tdr);
 
         // Heartbeat stats every 5s so a dead camera is visible immediately,
         // not at the end of the session.
@@ -220,7 +257,8 @@ CalibrationRun run_calibration(Config config) {
             print_stats();
         }
 
-        int key = cv::waitKey(30);
+        // 1 ms GUI pump — camera reads pace the loop, not an artificial sleep.
+        int key = cv::waitKey(1);
 
         if (key == 'q' || key == 27) {
             running = false;
@@ -228,6 +266,10 @@ CalibrationRun run_calibration(Config config) {
             int captured = 0;
             for (size_t i = 0; i < cam_mgr.count(); i++) {
                 if (detections[i].detected) {
+                    cv::cornerSubPix(detections[i].gray, detections[i].corners,
+                                     cv::Size(5, 5), cv::Size(-1, -1),
+                                     cv::TermCriteria(cv::TermCriteria::EPS +
+                                                      cv::TermCriteria::COUNT, 30, 0.01));
                     calibrator.add_sample(i, detections[i].corners,
                                           detections[i].ids, detections[i].frame_size);
                     captured++;

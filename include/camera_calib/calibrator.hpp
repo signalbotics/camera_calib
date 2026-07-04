@@ -6,6 +6,8 @@
 #include <opencv2/core.hpp>
 #include <opencv2/objdetect.hpp>
 #include <opencv2/objdetect/aruco_board.hpp>
+#include <opencv2/objdetect/aruco_detector.hpp>
+#include <opencv2/objdetect/charuco_detector.hpp>
 #include "camera_calib/config.hpp"
 
 namespace camera_calib {
@@ -71,6 +73,9 @@ private:
     cv::Ptr<cv::aruco::CharucoBoard> board_;
     cv::Ptr<cv::aruco::Dictionary> dictionary_;
     cv::Ptr<cv::aruco::DetectorParameters> detector_params_;
+    // Built once; constructing these per frame is pure waste.
+    cv::Ptr<cv::aruco::ArucoDetector> aruco_detector_;
+    cv::Ptr<cv::aruco::CharucoDetector> charuco_detector_;
 
     // Per-camera collected samples
     struct CameraSamples {

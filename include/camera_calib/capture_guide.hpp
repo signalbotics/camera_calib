@@ -111,7 +111,10 @@ private:
     PoseMetrics disp_;            // smoothed copy for display (EMA, kills jitter)
     bool disp_valid_ = false;
     float hold_ratio_ = 0.0f;     // stability progress toward capture [0,1]
-    static constexpr float SMOOTH_ALPHA = 0.25f;  // display smoothing factor
+    // Time-based smoothing: a fixed per-frame alpha makes the lag scale with
+    // however slow the loop happens to run.
+    static constexpr float SMOOTH_TAU = 0.08f;  // seconds to ~63% convergence
+    std::chrono::steady_clock::time_point last_disp_time_;
 
     bool stage_condition_met(const PoseMetrics& m) const;
     void advance_stage();
@@ -141,7 +144,7 @@ private:
 
     int classify_zone(const std::vector<cv::Point2f>& corners, cv::Size image_size) const;
     void advance_target();
-    bool is_sharp(const cv::Mat& gray) const;
+    bool is_sharp(const cv::Mat& gray, const std::vector<cv::Point2f>& corners) const;
     bool is_stable(const std::vector<cv::Point2f>& corners);
     cv::Point2f compute_centroid(const std::vector<cv::Point2f>& corners) const;
 };

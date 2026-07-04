@@ -101,9 +101,37 @@ int CaptureGuide::classify_zone(const std::vector<cv::Point2f>& corners,
     return row * grid_cols_ + col;
 }
 
-bool CaptureGuide::is_sharp(const cv::Mat& gray) const {
+bool CaptureGuide::is_sharp(const cv::Mat& gray,
+                            const std::vector<cv::Point2f>& corners) const {
+    // Sharpness only matters where the board is: crop its bounding box
+    // (padded) and cap the working size. A full-frame CV_64F Laplacian per
+    // frame was one of the biggest per-frame costs.
+    float min_x = corners[0].x, max_x = corners[0].x;
+    float min_y = corners[0].y, max_y = corners[0].y;
+    for (const auto& c : corners) {
+        min_x = std::min(min_x, c.x);
+        max_x = std::max(max_x, c.x);
+        min_y = std::min(min_y, c.y);
+        max_y = std::max(max_y, c.y);
+    }
+    float pad_x = (max_x - min_x) * 0.1f;
+    float pad_y = (max_y - min_y) * 0.1f;
+    int x0 = std::clamp(static_cast<int>(min_x - pad_x), 0, gray.cols - 1);
+    int y0 = std::clamp(static_cast<int>(min_y - pad_y), 0, gray.rows - 1);
+    int x1 = std::clamp(static_cast<int>(max_x + pad_x), x0 + 1, gray.cols);
+    int y1 = std::clamp(static_cast<int>(max_y + pad_y), y0 + 1, gray.rows);
+    cv::Mat roi = gray(cv::Rect(x0, y0, x1 - x0, y1 - y0));
+
+    cv::Mat small;
+    if (roi.cols > 320) {
+        cv::resize(roi, small, cv::Size(320, roi.rows * 320 / roi.cols),
+                   0, 0, cv::INTER_AREA);
+    } else {
+        small = roi;
+    }
+
     cv::Mat laplacian;
-    cv::Laplacian(gray, laplacian, CV_64F);
+    cv::Laplacian(small, laplacian, CV_16S);
     cv::Scalar mean, stddev;
     cv::meanStdDev(laplacian, mean, stddev);
     return (stddev[0] * stddev[0]) > SHARP_THRESHOLD;
@@ -256,14 +284,18 @@ bool CaptureGuide::update(const std::vector<cv::Point2f>& corners,
 
     // Smoothed copy for display. The homography center is stable regardless
     // of which subset of corners was detected this frame (the raw centroid of
-    // detected corners jumps when detections drop in and out).
+    // detected corners jumps when detections drop in and out). Smoothing is
+    // time-based, so the response doesn't slow down when the frame rate does.
     if (last_metrics_.valid) {
+        auto now = std::chrono::steady_clock::now();
         if (!disp_valid_) {
             disp_ = last_metrics_;
             disp_valid_ = true;
         } else {
-            auto ema = [](float prev, float now) {
-                return prev + SMOOTH_ALPHA * (now - prev);
+            float dt = std::chrono::duration<float>(now - last_disp_time_).count();
+            float alpha = 1.0f - std::exp(-dt / SMOOTH_TAU);
+            auto ema = [alpha](float prev, float now_v) {
+                return prev + alpha * (now_v - prev);
             };
             disp_.center_x = ema(disp_.center_x, last_metrics_.center_x);
             disp_.center_y = ema(disp_.center_y, last_metrics_.center_y);
@@ -271,9 +303,10 @@ bool CaptureGuide::update(const std::vector<cv::Point2f>& corners,
             disp_.tilt_x = ema(disp_.tilt_x, last_metrics_.tilt_x);
             disp_.tilt_y = ema(disp_.tilt_y, last_metrics_.tilt_y);
         }
+        last_disp_time_ = now;
     }
 
-    bool sharp = is_sharp(gray_frame);
+    bool sharp = is_sharp(gray_frame, corners);
     last_sharp_ = sharp;
     last_stable_ = is_stable(corners);  // status chip only; capture uses the hold
 
@@ -427,8 +460,10 @@ void CaptureGuide::draw_overlay(cv::Mat& display, const std::vector<int>& merged
         }
     }
     if (show_flash) {
-        cv::Mat tint(display.size(), display.type(), SUCCESS);
-        cv::addWeighted(tint, flash_alpha, display, 1.0 - flash_alpha, 0, display);
+        // Scalar blend in place — allocating a full-size tint Mat per frame
+        // during the flash cost ~31 MB per iteration on a 4K display.
+        display.convertTo(display, -1, 1.0 - flash_alpha, 0);
+        cv::add(display, SUCCESS * flash_alpha, display);
     }
 
     // --- HUD: top bar with primary instruction ---
